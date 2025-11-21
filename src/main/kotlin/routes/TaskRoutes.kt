@@ -65,59 +65,70 @@ fun Route.taskRoutes() {
      * Returns full page (no HTMX differentiation in Week 6)
      */
     get("/tasks") {
-        val model =
-            mapOf(
-                "title" to "Tasks",
-                "tasks" to TaskRepository.all(),
-            )
-        val template = pebble.getTemplate("tasks/index.peb")
-        val writer = StringWriter()
-        template.evaluate(writer, model)
-        call.respondText(writer.toString(), ContentType.Text.Html)
-    }
+    val query = call.request.queryParameters["q"].orEmpty()
+    val page = call.request.queryParameters["page"]?.toIntOrNull() ?: 1
+    val data = repo.search(query = query, page = page, size = 10)
+
+    // Add session info for footer
+    val sessionId = call.sessions.get<UserSession>()?.id ?: "guest"
+    val isHtmx = call.request.headers["HX-Request"]?.equals("true", ignoreCase = true) == true
+
+    val model = mapOf(
+        "title" to "Tasks",
+        "page" to data,
+        "query" to query,
+        "sessionId" to sessionId,
+        "isHtmx" to isHtmx
+    )
+    call.respondHtml(PebbleRender.render("tasks/index.peb", model))
+}
 
     /**
      * POST /tasks - Add new task
      * Dual-mode: HTMX fragment or PRG redirect
      */
     post("/tasks") {
+    val reqId = newReqId()
+    call.attributes.put(RequestIdKey, reqId)
+
+    val session = call.request.cookies["sid"] ?: "anon"
+    val jsMode = call.jsMode()
+
+    call.timed(taskCode = "T3_add", jsMode = jsMode) {
         val title = call.receiveParameters()["title"].orEmpty().trim()
 
+        // Validation
         if (title.isBlank()) {
-            // Validation error handling
+            Logger.validationError(session, reqId, "T3_add", "blank_title", 0, jsMode)
             if (call.isHtmx()) {
-                val error = """<div id="status" hx-swap-oob="true" role="alert" aria-live="assertive">
-                    Title is required. Please enter at least one character.
-                </div>"""
-                return@post call.respondText(error, ContentType.Text.Html, HttpStatusCode.BadRequest)
+                val status = """<div id="status" hx-swap-oob="true">Title is required.</div>"""
+                return@timed call.respondText(status, ContentType.Text.Html, HttpStatusCode.BadRequest)
             } else {
-                // No-JS: redirect back (could add error query param)
-                return@post call.respond(HttpStatusCode.SeeOther)
+                return@timed call.respondRedirect("/tasks?error=title")
             }
         }
 
-        val task = TaskRepository.add(title)
-
-        if (call.isHtmx()) {
-            // Return HTML fragment for new task
-            val fragment = """<li id="task-${task.id}">
-                <span>${task.title}</span>
-                <form action="/tasks/${task.id}/delete" method="post" style="display: inline;"
-                      hx-post="/tasks/${task.id}/delete"
-                      hx-target="#task-${task.id}"
-                      hx-swap="outerHTML">
-                  <button type="submit" aria-label="Delete task: ${task.title}">Delete</button>
-                </form>
-            </li>"""
-
-            val status = """<div id="status" hx-swap-oob="true">Task "${task.title}" added successfully.</div>"""
-
-            return@post call.respondText(fragment + status, ContentType.Text.Html, HttpStatusCode.Created)
+        if (title.length > 200) {
+            Logger.validationError(session, reqId, "T3_add", "max_length", 0, jsMode)
+            if (call.isHtmx()) {
+                val status = """<div id="status" hx-swap-oob="true">Title too long (max 200 chars).</div>"""
+                return@timed call.respondText(status, ContentType.Text.Html, HttpStatusCode.BadRequest)
+            } else {
+                return@timed call.respondRedirect("/tasks?error=title&msg=too_long")
+            }
         }
 
-        // No-JS: POST-Redirect-GET pattern (303 See Other)
-        call.respondRedirect("/tasks")
+        // Success path
+        val task = repo.add(title)
+        if (call.isHtmx()) {
+            val item = PebbleRender.render("tasks/_item.peb", mapOf("t" to task))
+            val status = """<div id="status" hx-swap-oob="true">Added "${task.title}".</div>"""
+            call.respondText(item + status, ContentType.Text.Html)
+        } else {
+            call.respondRedirect("/tasks")
+        }
     }
+}
 
     /**
      * POST /tasks/{id}/delete - Delete task
